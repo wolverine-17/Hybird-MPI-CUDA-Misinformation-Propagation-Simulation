@@ -1,0 +1,7 @@
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+engine/bin/
+__pycache__/
+*.pyc
+tmp/
