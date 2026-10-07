@@ -1,4 +1,6 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import NetworkView from "./NetworkView";
+import { decodeGraph, type ExecutionPlan, type NetworkGraph, type PartitionEvent } from "./network";
 
 type Progress = {
   kind: "progress";
@@ -10,7 +12,7 @@ type Progress = {
   maxBelievers: number;
   maxBelieversTick: number;
   elapsedSeconds: number;
-  previewStates?: number[];
+  nodeStates?: string;
 };
 type Summary = {
   kind: "summary";
@@ -31,12 +33,8 @@ type Summary = {
   sourceNode?: number;
   seed?: number;
   meanDegree?: number;
-};
-type Preview = {
-  nodes: { id: number; x: number; y: number }[];
-  edges: [number, number][];
-  totalNodes: number;
-  shownNodes: number;
+  communicationSeconds?: number;
+  crossEdges?: number;
 };
 type Config = {
   nodes: number;
@@ -49,8 +47,6 @@ type Config = {
   forget: number;
   seed: number;
   sourceNode: number;
-  previewNodes: number;
-  mpiRanks: number;
 };
 
 const initialConfig: Config = {
@@ -64,8 +60,6 @@ const initialConfig: Config = {
   forget: 0.1,
   seed: 42,
   sourceNode: -1,
-  previewNodes: 180,
-  mpiRanks: 1,
 };
 const compact = new Intl.NumberFormat("en", {
   notation: "compact",
@@ -91,7 +85,7 @@ function StateChart({ data, nodes }: { data: Progress[]; nodes: number }) {
       <svg
         viewBox={`0 0 ${w} ${h}`}
         role="img"
-        aria-label="Replayed S, B and F population counts"
+        aria-label="Live S, B and F population counts"
       >
         {[0, 0.25, 0.5, 0.75, 1].map((r) => (
           <g key={r}>
@@ -146,61 +140,6 @@ function StateChart({ data, nodes }: { data: Progress[]; nodes: number }) {
   );
 }
 
-function NetworkPreview({
-  graph,
-  selected,
-  states,
-  disabled,
-  onSelect,
-}: {
-  graph: Preview;
-  selected: number;
-  states?: number[];
-  disabled: boolean;
-  onSelect: (id: number) => void;
-}) {
-  const byId = new Map(graph.nodes.map((n) => [n.id, n]));
-  return (
-    <div className="network-wrap">
-      <svg
-        viewBox="-15 -15 130 130"
-        role="img"
-        aria-label={`Selectable preview of ${graph.shownNodes} of ${graph.totalNodes} nodes`}
-      >
-        <g className="network-edges">
-          {graph.edges.map(([a, b], i) => {
-            const u = byId.get(a)!,
-              v = byId.get(b)!;
-            return <line key={i} x1={u.x} y1={u.y} x2={v.x} y2={v.y} />;
-          })}
-        </g>
-        <g>
-          {graph.nodes.map((n, i) => {
-            const state = states?.[i] ?? 0,
-              cls = state === 1 ? "node-b" : state === 2 ? "node-f" : "node-s";
-            return (
-              <circle
-                key={n.id}
-                className={`${cls} ${selected === n.id ? "selected" : ""}`}
-                cx={n.x}
-                cy={n.y}
-                r={selected === n.id ? 2.25 : 1.35}
-                role="button"
-                aria-label={`Select node ${n.id} as source`}
-                onClick={() => !disabled && onSelect(n.id)}
-              />
-            );
-          })}
-        </g>
-      </svg>
-      <p>
-        {graph.shownNodes.toLocaleString()} selectable nodes shown from a{" "}
-        {graph.totalNodes.toLocaleString()}-node network
-      </p>
-    </div>
-  );
-}
-
 function NumberField({
   label,
   name,
@@ -235,13 +174,22 @@ function NumberField({
 
 export default function App() {
   const [config, setConfig] = useState(initialConfig),
-    [graph, setGraph] = useState<Preview | null>(null),
+    [graph, setGraph] = useState<NetworkGraph | null>(null),
     [frames, setFrames] = useState<Progress[]>([]),
     [summary, setSummary] = useState<Summary | null>(null),
     [running, setRunning] = useState(false),
     [status, setStatus] = useState("Configure the network"),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [controlsOpen, setControlsOpen] = useState(true),
+    [preparing, setPreparing] = useState(false),
+    [partitioned, setPartitioned] = useState(false),
+    [executionPlan, setExecutionPlan] = useState<ExecutionPlan | null>(null),
+    [partition, setPartition] = useState<PartitionEvent | null>(null),
+    [nodeStates, setNodeStates] = useState<string | Uint8Array | undefined>();
   const eventSource = useRef<EventSource | null>(null);
+  const stopUpdates = useRef<() => void>(() => {});
+  useEffect(() => () => { eventSource.current?.close(); stopUpdates.current(); }, []);
+  const mpiRanks = partition?.mpiRanks ?? executionPlan?.mpiRanks ?? 2;
   const current = frames.at(-1),
     percent = Math.min(
       100,
@@ -257,45 +205,80 @@ export default function App() {
     [current, config.nodes],
   );
   const update = (name: keyof Config, value: number) => {
+    if (running || preparing) return;
     const reset = ["nodes", "meanDegree", "seed"].includes(name);
     setConfig((old) => ({
       ...old,
       [name]: value,
       sourceNode: reset ? -1 : old.sourceNode,
     }));
-    if (reset) setGraph(null);
+    if (reset) { setGraph(null); setFrames([]); setSummary(null); setNodeStates(undefined); setPartitioned(false); setPartition(null); setExecutionPlan(null); }
   };
   async function prepareGraph() {
+    if (running || preparing) return;
+    setPreparing(true);
+    setPartitioned(false);
+    setPartition(null);
+    setNodeStates(undefined);
     setError("");
-    setStatus("Generating graph preview");
+    setStatus("Generating complete network");
     try {
       const q = new URLSearchParams({
           nodes: String(config.nodes),
           meanDegree: String(config.meanDegree),
           seed: String(config.seed),
-          limit: String(config.previewNodes),
+          format: "binary",
         }),
-        r = await fetch(`/api/graph-preview?${q}`),
-        data = await r.json();
-      if (!r.ok) throw new Error(data.error);
+        r = await fetch(`/api/graph?${q}`);
+      if (!r.ok) throw new Error((await r.json()).error);
+      let data: NetworkGraph;
+      if (r.headers.get("Content-Type")?.includes("application/octet-stream")) {
+        const length = Number(r.headers.get("Content-Length"));
+        // A notebook proxy may remove Content-Length when forwarding the body.
+        if (!Number.isSafeInteger(length) || length < 16) {
+          setStatus("Downloading complete network");
+          data = decodeGraph(await r.arrayBuffer());
+        } else {
+        const bytes = new Uint8Array(length), reader = r.body?.getReader();
+        if (!reader) throw new Error("Graph download could not start");
+        let received = 0, lastPercent = -1;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (received + value.byteLength > length) { await reader.cancel(); throw new Error("Graph download exceeds its expected size"); }
+          bytes.set(value, received); received += value.byteLength;
+          const percent = Math.floor(received * 100 / length);
+          if (percent !== lastPercent) { setStatus(`Downloading complete network: ${percent}%`); lastPercent = percent; }
+        }
+        if (received !== length) throw new Error("Incomplete graph download");
+        data = decodeGraph(bytes.buffer);
+        }
+        data.executionPlan = JSON.parse(r.headers.get("X-Execution-Plan") || "null") ?? undefined;
+      } else data = await r.json();
       setGraph(data);
+      setExecutionPlan(data.executionPlan ?? null);
       setFrames([]);
       setSummary(null);
       setConfig((old) => ({ ...old, sourceNode: -1 }));
-      setStatus("Select one node as the Believer source");
+      setStatus("Select a source in the 3D network");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
-      setStatus("Preview failed");
+      setStatus("Network generation failed");
+    } finally {
+      setPreparing(false);
     }
   }
   async function runSimulation() {
-    if (config.sourceNode < 0 || running) return;
+    if (!graph || config.sourceNode < 0 || running || preparing) return;
     setError("");
     setFrames([]);
     setSummary(null);
+    setNodeStates(undefined);
+    setPartitioned(false);
+    setPartition(null);
     setRunning(true);
     setStatus("Launching MPI + CUDA engine");
-    eventSource.current?.close();
+    eventSource.current?.close(); stopUpdates.current();
     try {
       const response = await fetch("/api/simulations", {
         method: "POST",
@@ -305,19 +288,76 @@ export default function App() {
       const result = await response.json();
       if (!response.ok) throw new Error(result.error ?? "Simulation request failed");
 
+      setExecutionPlan(result.executionPlan);
+      setControlsOpen(false);
       const source = new EventSource(`/api/simulations/${result.id}/events`);
       eventSource.current = source;
-      source.onmessage = (message) => {
-        const event = JSON.parse(message.data) as Progress | Summary | { kind: "error"; message: string };
-        if (event.kind === "progress") {
-          setFrames((old) => [...old, event]);
-          setStatus(`Hybrid simulation: tick ${event.tick} / ${config.ticks}`);
+      let active = true, stateTag = '', pendingState: Promise<void> | undefined;
+      let pollTimer: ReturnType<typeof setTimeout> | undefined;
+      const controller = new AbortController();
+      const pendingCounts: Progress[] = [];
+      let flushTimer: ReturnType<typeof setTimeout> | undefined;
+      const flushCounts = () => {
+        if (flushTimer) clearTimeout(flushTimer); flushTimer = undefined;
+        if (pendingCounts.length) {
+          const batch = pendingCounts.splice(0); setFrames(old => [...old, ...batch]);
+          setStatus(`Hybrid simulation: tick ${batch.at(-1)!.tick} / ${config.ticks}`);
+        }
+      };
+      const fetchState = (): Promise<void> => {
+        if (pendingState) return pendingState;
+        pendingState = (async () => {
+          const r = await fetch(`/api/simulations/${result.id}/state`, { signal: controller.signal, cache: 'no-store', headers: stateTag ? { 'If-None-Match': stateTag } : {} });
+          if (r.status === 204 || r.status === 304) return;
+          if (!r.ok) throw new Error('Could not retrieve the latest node colors');
+          const state = new Uint8Array(await r.arrayBuffer());
+          if (state.length !== graph.totalNodes) throw new Error('Engine state length does not match the network. Rebuild the engine and retry.');
+          if (active) { stateTag = r.headers.get('ETag') || ''; setNodeStates(state); }
+        })().finally(() => { pendingState = undefined; });
+        return pendingState;
+      };
+      const poll = async () => {
+        try { await fetchState(); }
+        catch (e) { if (active) setError(e instanceof Error ? e.message : String(e)); }
+        if (active) pollTimer = setTimeout(poll, 250);
+      };
+      stopUpdates.current = () => { active = false; controller.abort(); clearTimeout(pollTimer); clearTimeout(flushTimer); };
+      void poll();
+      source.onmessage = async (message) => {
+        const event = JSON.parse(message.data) as Progress | Summary | PartitionEvent | { kind: "error"; message: string };
+        if (event.kind === "partition") {
+          setPartition(event);
+          setPartitioned(true);
+          setStatus(`MPI divided the graph into ${event.mpiRanks} connected partitions`);
+        } else if (event.kind === "progress") {
+          if (event.nodeStates !== undefined) {
+            if (event.nodeStates.length !== graph.totalNodes) {
+              setError("Engine state length does not match the network. Rebuild the engine and retry.");
+              setRunning(false); source.close(); return;
+            }
+            setNodeStates(event.nodeStates);
+          }
+          // Keep only counts in chart history, never N-node snapshots per tick.
+          const { nodeStates: snapshot, ...counts } = event;
+          void snapshot;
+          pendingCounts.push(counts);
+          if (!flushTimer) flushTimer = setTimeout(flushCounts, 100);
         } else if (event.kind === "summary") {
+          source.close();
+          flushCounts();
+          setStatus("Simulation finished; displaying final node colors");
+          if (pollTimer) clearTimeout(pollTimer);
+          // An in-flight response may predate completion; fetch again for final colors.
+          try { if (pendingState) await pendingState; await fetchState(); }
+          catch (e) { if (active) setError(e instanceof Error ? e.message : String(e)); }
+          if (!active) return;
+          stopUpdates.current();
           setSummary(event);
           setRunning(false);
           setStatus("Simulation completed");
           source.close();
         } else {
+          flushCounts(); stopUpdates.current();
           setError(event.message);
           setRunning(false);
           setStatus("Simulation failed");
@@ -326,12 +366,14 @@ export default function App() {
       };
       source.onerror = () => {
         if (source.readyState === EventSource.CLOSED) return;
+        flushCounts(); stopUpdates.current();
         setError("Connection to the Colab simulation stream was interrupted.");
         setRunning(false);
         setStatus("Connection interrupted");
         source.close();
       };
     } catch (err) {
+      stopUpdates.current();
       setError(err instanceof Error ? err.message : String(err));
       setRunning(false);
       setStatus("Simulation failed");
@@ -356,8 +398,16 @@ export default function App() {
           {status}
         </div>
       </header>
-      <div className="layout">
-        <aside className="controls">
+      <div className="workspace-actions">
+        <button className="tool-button" aria-expanded={controlsOpen} aria-controls="parameter-panel" onClick={() => setControlsOpen(!controlsOpen)}>{controlsOpen ? "Hide parameters" : "Show parameters"}</button>
+        <span>{config.nodes.toLocaleString()} users · {executionPlan ? mpiRanks : "Auto"} MPI rank{mpiRanks === 1 ? "" : "s"}</span>
+        <button className="tool-button" disabled={running || preparing} onClick={prepareGraph}>{preparing ? "Generating…" : "Generate network"}</button>
+        <button className="tool-button accent" disabled={!graph || config.sourceNode < 0 || running || preparing} onClick={runSimulation}>{running ? "Simulation running…" : "Run simulation"}</button>
+      </div>
+      <div className={`layout ${controlsOpen ? "" : "expanded"}`}>
+        {controlsOpen && <aside className="controls" id="parameter-panel">
+          <button className="close-parameters" onClick={() => setControlsOpen(false)}>Close parameters ×</button>
+          <fieldset disabled={running || preparing}>
           <section>
             <h2>Network and execution</h2>
             <NumberField
@@ -375,14 +425,11 @@ export default function App() {
               min={2}
               onChange={update}
             />
-            <NumberField
-              label="MPI ranks (1 for Colab T4)"
-              name="mpiRanks"
-              value={config.mpiRanks}
-              min={1}
-              max={64}
-              onChange={update}
-            />
+            <div className="execution-plan">
+              <strong>Automatic MPI partitioning</strong>
+              <p>{executionPlan ? `${mpiRanks} partitions selected for this network` : "Partitions are selected after generating the network"}</p>
+              <p>{executionPlan?.benchmarked ? "Selected by a benchmark on this Colab GPU" : executionPlan?.sharedGpu ? "MPI processes share the Colab GPU" : "Based on network size and available resources"}</p>
+            </div>
             <NumberField
               label="Simulation ticks"
               name="ticks"
@@ -398,14 +445,6 @@ export default function App() {
               onChange={update}
             />
             <NumberField
-              label="Preview nodes"
-              name="previewNodes"
-              value={config.previewNodes}
-              min={20}
-              max={400}
-              onChange={update}
-            />
-            <NumberField
               label="Random seed"
               name="seed"
               value={config.seed}
@@ -413,7 +452,7 @@ export default function App() {
               onChange={update}
             />
             <button type="button" className="secondary" onClick={prepareGraph}>
-              1. Generate graph preview
+              1. Generate complete network
             </button>
           </section>
           <section>
@@ -470,14 +509,15 @@ export default function App() {
           >
             {running ? "Running MPI + CUDA…" : "2. Run hybrid simulation"}
           </button>
-        </aside>
+          </fieldset>
+        </aside>}
         <section className="workspace">
           {graph ? (
             <>
               <div className="chart-heading">
                 <div>
-                  <h2>Selectable network preview</h2>
-                  <p>Click one node to make it the only initial Believer</p>
+                  <h2>Interactive 3D social network</h2>
+                  <p>{partitioned ? `MPI assignments: ${mpiRanks} partition${mpiRanks === 1 ? "" : "s"} · C1–C${mpiRanks}` : "Explore every node and select the initial Believer"}</p>
                 </div>
                 <div className="legend">
                   <span className="s">S</span>
@@ -485,11 +525,14 @@ export default function App() {
                   <span className="f">F</span>
                 </div>
               </div>
-              <NetworkPreview
+              <NetworkView
                 graph={graph}
                 selected={config.sourceNode}
-                states={current?.previewStates}
-                disabled={running}
+                seed={config.seed}
+                ranks={mpiRanks}
+                partitioned={partitioned}
+                states={nodeStates}
+                disabled={running || preparing}
                 onSelect={(id) => {
                   setConfig((old) => ({ ...old, sourceNode: id }));
                   setStatus(`Node ${id} selected as the only Believer`);
@@ -500,10 +543,21 @@ export default function App() {
             <div className="empty-network">
               <strong>No graph prepared</strong>
               <span>
-                Set the network inputs and generate a selectable preview.
+                Set the network inputs and generate the complete 3D network.
               </span>
             </div>
           )}
+          {partitioned && partition && <>
+            <p className="partition-explanation">{partition.crossEdges.toLocaleString()} connections cross MPI partitions. Each rank exchanges the neighbour states it needs; every original connection is preserved.</p>
+            <div className="partition-strip" aria-label="MPI node assignments">
+              {partition.partitions.map(p => <div key={p.rank}>
+                <strong>C{p.rank + 1}</strong>
+                <span>Rank {p.rank} · nodes {p.begin.toLocaleString()}–{(p.end - 1).toLocaleString()}</span>
+                <span>{(p.end - p.begin).toLocaleString()} users · {p.ghostNodes.toLocaleString()} remote neighbours</span>
+                <span>CUDA device {p.gpu}</span>
+              </div>)}
+            </div>
+          </>}
           <div className="metric-row">
             {metrics.map(([label, value, c]) => (
               <article key={label} className={`metric ${c}`}>
@@ -512,6 +566,7 @@ export default function App() {
               </article>
             ))}
           </div>
+          <p className="progress-caption">Tick {current?.tick ?? 0} / {summary?.ticks ?? config.ticks} · {percent.toFixed(0)}% complete</p>
           <div
             className="progress-track"
             aria-label={`${percent.toFixed(0)} percent complete`}
@@ -561,6 +616,18 @@ export default function App() {
               <div>
                 <span>Hybrid simulation</span>
                 <strong>{summary.simulationSeconds.toFixed(3)} s</strong>
+              </div>
+              <div>
+                <span>MPI communication</span>
+                <strong>{(summary.communicationSeconds ?? 0).toFixed(3)} s</strong>
+              </div>
+              <div>
+                <span>Cross-partition connections</span>
+                <strong>{(summary.crossEdges ?? 0).toLocaleString()}</strong>
+              </div>
+              <div>
+                <span>MPI partitions</span>
+                <strong>{summary.mpiRanks ?? mpiRanks}</strong>
               </div>
               <div>
                 <span>Total execution</span>
