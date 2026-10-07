@@ -33,7 +33,11 @@ expands the workspace; progress and analytics are underneath. The notebook ifram
 requests fullscreen permission; parent browser restrictions may still apply.
 
 Rendering uses your browser's GPU. Start with 10,000 nodes, then try 100,000.
-Larger/dense networks depend on browser memory and graphics hardware. Hide
+At 20,000 nodes and above, approximate spring layout also runs on the browser
+GPU, with positions kept on-device. Every node is drawn. The overview shows at
+most 100,000 connections; use **Draw all connections (slower)** for every edge.
+All original edges remain in the simulation. Larger/dense networks depend on
+browser memory and graphics hardware. Hide
 connections to reduce clutter or increase the sampling interval to reduce live
 state traffic. There is no capped or sampled node preview.
 
@@ -41,3 +45,16 @@ After updating, start a fresh Colab runtime and run all cells so the server,
 frontend, and native binary use the same version. The build cell checks real
 MPI/CUDA results with 1/2/3/4 ranks before the dashboard opens. If this validation
 fails, its error output identifies the failing launch or state comparison.
+
+For measured rank selection, add and run a cell after the engine has built:
+
+```python
+!python3 /content/sbfc-app/engine/tests/benchmark_ranks.py --nodes 1000000 --mean-degree 6 --ticks 100 --repeats 2
+```
+
+It compares 2/4/8/10 ranks, skipping candidates outside the GPU-memory budget.
+Allow several minutes and run it while no simulation is active. Regenerate the
+same graph size/degree in the app to use the fastest median simulation time.
+The result applies only to this GPU runtime; changed probabilities or visualization
+sampling can affect performance. The normal conservative selection remains when
+there is no matching benchmark. Change `--nodes` to benchmark a different size.

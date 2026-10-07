@@ -52,6 +52,16 @@ class ProtocolTests(unittest.TestCase):
         two_gpu = server.choose_execution_plan(100000, 6, 2, [1200, 1200])
         self.assertEqual(two_gpu["mpiRanks"], 4)
 
+    def test_measured_choice_can_use_ten_ranks_on_the_matching_runtime(self):
+        profile = {"nodes": 1000000, "meanDegree": 6, "gpuIds": ["GPU-test"], "mpiRanks": 10}
+        self.assertEqual(server.measured_rank_choice(profile, 1000000, 6, ["GPU-test"], [15000]), 10)
+        self.assertIsNone(server.measured_rank_choice(profile, 10000, 6, ["GPU-test"], [15000]))
+        self.assertIsNone(server.measured_rank_choice(profile, 1000000, 8, ["GPU-test"], [15000]))
+        self.assertIsNone(server.measured_rank_choice(profile, 1000000, 6, ["GPU-other"], [15000]))
+        self.assertIsNone(server.measured_rank_choice(profile, 1000000, 6, ["GPU-test"], [1000]))
+        for ranks in (0, 11, "10", True):
+            self.assertIsNone(server.measured_rank_choice(dict(profile, mpiRanks=ranks), 1000000, 6, ["GPU-test"], [15000]))
+
     def test_old_rank_input_cannot_override_auto_selection(self):
         config = server.validate_config({"nodes": 100000, "sourceNode": 99999, "mpiRanks": 64})
         self.assertNotIn("mpiRanks", config)

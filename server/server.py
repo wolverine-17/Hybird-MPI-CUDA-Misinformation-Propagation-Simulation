@@ -63,6 +63,24 @@ def validate_config(raw: dict) -> dict:
     return config
 
 
+def rank_fits_memory(nodes: int, mean_degree: int, ranks: int, gpu_free_mib: list[int]) -> bool:
+    if not gpu_free_mib:
+        return False
+    budget = min(gpu_free_mib) * 1024**2 * 0.70
+    processes = math.ceil(ranks / len(gpu_free_mib))
+    estimated = nodes * (mean_degree * 4 + 10) + processes * (384 * 1024**2 + nodes)
+    return estimated <= budget
+
+
+def measured_rank_choice(profile: dict, nodes: int, mean_degree: int, gpu_ids: list[str], gpu_free_mib: list[int]) -> int | None:
+    if profile.get("nodes") != nodes or profile.get("meanDegree") != mean_degree or profile.get("gpuIds") != gpu_ids or not gpu_ids:
+        return None
+    ranks = profile.get("mpiRanks")
+    if type(ranks) is not int or not 2 <= ranks <= min(10, nodes):
+        return None
+    return ranks if rank_fits_memory(nodes, mean_degree, ranks, gpu_free_mib) else None
+
+
 def choose_execution_plan(nodes: int, mean_degree: int, cpu_slots: int, gpu_free_mib: list[int]) -> dict:
     """A bounded heuristic, not a claim that more ranks always run faster."""
     target = 25_000
@@ -96,7 +114,17 @@ def automatic_execution_plan(nodes: int, mean_degree: int) -> dict:
         gpu_free_mib = [int(line.strip()) for line in probe.stdout.splitlines() if line.strip()]
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
-    return choose_execution_plan(nodes, mean_degree, cpu_slots, gpu_free_mib)
+    plan = choose_execution_plan(nodes, mean_degree, cpu_slots, gpu_free_mib)
+    try:
+        profile = json.loads((ENGINE_DIR / "rank-profile.json").read_text(encoding="utf-8"))
+        probe = subprocess.run(["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
+                               capture_output=True, text=True, check=True, timeout=5)
+        ranks = measured_rank_choice(profile, nodes, mean_degree, probe.stdout.splitlines(), gpu_free_mib)
+        if ranks is not None:
+            plan.update(mpiRanks=ranks, sharedGpu=ranks > len(gpu_free_mib), benchmarked=True)
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
+        pass
+    return plan
 
 
 def graph_preview(nodes: int, mean_degree: int, seed: int) -> dict:

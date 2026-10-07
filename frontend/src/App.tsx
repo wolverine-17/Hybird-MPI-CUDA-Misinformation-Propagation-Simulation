@@ -360,7 +360,7 @@ export default function App() {
             <div className="execution-plan">
               <strong>Automatic MPI partitioning</strong>
               <p>{executionPlan ? `${mpiRanks} partitions selected for this network` : "Partitions are selected after generating the network"}</p>
-              <p>{executionPlan?.sharedGpu ? "MPI processes share the Colab GPU" : "Based on network size and available resources"}</p>
+              <p>{executionPlan?.benchmarked ? "Selected by a benchmark on this Colab GPU" : executionPlan?.sharedGpu ? "MPI processes share the Colab GPU" : "Based on network size and available resources"}</p>
             </div>
             <NumberField
               label="Simulation ticks"

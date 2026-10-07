@@ -14,8 +14,12 @@ repository contains only the proposed hybrid MPI+CUDA system and its React UI.
    separates into C1...Cn according to the actual MPI rank assignments.
 6. Review reach, peak Believers, peak tick, graph time, simulation time, and total time.
 
-The browser renders every configured node and connection using WebGL 2 buffers,
-with a spring layout and spatial-cell repulsion in a background worker. There is
+The browser renders every configured node using WebGL 2 buffers. Below 20,000
+nodes, spring layout and spatial-cell repulsion run in a background worker.
+Larger graphs use a GPU-resident approximate spring layout with at most eight
+sampled neighbours per node, plus a radial spreading force. Position updates stay
+on the browser GPU; only a dragged/focused node is read back. This layout sample
+changes the picture, never the simulation graph or MPI messages. There is
 no 180/400-node preview cap. Use Hide parameters to expand the workspace, or
 Fullscreen for the network alone; progress and analytics remain below the view.
 Shift-drag or right-drag pans the camera. Pause motion freezes the layout without
@@ -23,8 +27,12 @@ stopping the simulation. Hide connections reduces visual clutter and GPU work.
 
 100,000 nodes is a useful large-network starting point. Larger networks depend on
 browser memory and the local machine's GPU: visualization runs on the browser's
-GPU, while simulation runs on Colab's GPU. All connections are loaded and drawn
-when enabled, so dense graphs cost more. Increase Record every N ticks to reduce
+GPU, while simulation runs on Colab's GPU. All connections are loaded. The
+overview draws at most 100,000 evenly sampled connections and explicitly shows
+that count; **Draw all connections (slower)** restores the complete edge display.
+Large graphs use one-pixel nodes, a capped canvas pixel ratio, a 30-frame-per-second
+draw schedule, and GPU picking. Layout pauses during camera/node gestures.
+Increase Record every N ticks to reduce
 full-network state traffic for large runs. Only the latest node-state snapshot is
 retained alongside population-count history.
 
@@ -39,6 +47,22 @@ CPU count. A conservative GPU-memory estimate can lower the count further.
 For a typical two-CPU Colab runtime with enough GPU memory, 10,000 nodes selects
 two ranks and 100,000 selects four. These are workload partitions, not additional
 GPUs; several processes may share one GPU. More ranks do not guarantee speedup.
+
+To compare 2, 4, 8, and 10 ranks on the actual Colab GPU, run this in a new
+notebook cell after building the engine (avoid running it during a simulation):
+
+```python
+!python3 /content/sbfc-app/engine/tests/benchmark_ranks.py --nodes 1000000 --mean-degree 6 --ticks 100 --repeats 2
+```
+
+This can take several minutes because each trial also generates its graph.
+It chooses the lowest median simulation time and stores a runtime-local profile.
+Regenerate a graph with the same node count and mean degree; automatic selection
+uses that measured rank count, including ten if it wins and fits GPU memory.
+The profile is tied to GPU UUIDs and rejected on a different runtime or insufficient
+free memory. The probe uses default SBFC probabilities and sparse visualization
+sampling; different parameters and frame rates can change the fastest choice.
+Without a matching profile the conservative heuristic above remains active.
 
 The launcher uses `--oversubscribe --bind-to none` on Linux, allowing multiple
 partitions even when Open MPI advertises only one CPU slot. Rank count is

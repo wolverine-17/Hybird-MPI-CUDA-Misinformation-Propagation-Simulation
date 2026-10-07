@@ -67,6 +67,19 @@ self.onmessage = (event: MessageEvent) => {
       positions[i * 3 + 1] = Math.sqrt(1 - z * z) * Math.sin(angle) * r;
       positions[i * 3 + 2] = z * r;
     }
+    if (data.gpu) {
+      // Reservoir sampling caps layout work at eight neighbours per node,
+      // including both endpoints. Keep all edges in the simulation and viewer.
+      const neighbours = new Uint32Array(data.nodes * 8); neighbours.fill(data.nodes);
+      const add = (a: number, b: number) => {
+        const seen = degree[a]++;
+        const slot = seen < 8 ? seen : Math.floor(random() * (seen + 1));
+        if (slot < 8) neighbours[a * 8 + slot] = b;
+      };
+      for (let e = 0; e < edges.length; e += 2) { add(edges[e], edges[e + 1]); add(edges[e + 1], edges[e]); }
+      self.postMessage({ positions, neighbours, settled: false }, { transfer: [positions.buffer, neighbours.buffer] });
+      return;
+    }
     for (const node of edges) degree[node]++;
     const copy = positions.slice();
     self.postMessage({ positions: copy, settled: false }, { transfer: [copy.buffer] });

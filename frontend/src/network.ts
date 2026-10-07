@@ -1,4 +1,4 @@
-export type ExecutionPlan = { mpiRanks: number; cpuSlots: number; gpuCount: number; sharedGpu: boolean; targetNodesPerRank: number; automatic: boolean };
+export type ExecutionPlan = { mpiRanks: number; cpuSlots: number; gpuCount: number; sharedGpu: boolean; targetNodesPerRank: number; automatic: boolean; benchmarked?: boolean };
 export type NetworkGraph = { totalNodes: number; edgeCount: number; edges: number[]; executionPlan?: ExecutionPlan };
 export type PartitionInfo = { rank: number; begin: number; end: number; ghostNodes: number; adjacencyEntries: number; gpu: number };
 export type PartitionEvent = { kind: 'partition'; mpiRanks: number; crossEdges: number; partitions: PartitionInfo[] };
