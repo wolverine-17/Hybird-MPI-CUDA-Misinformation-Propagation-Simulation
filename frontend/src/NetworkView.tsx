@@ -4,7 +4,7 @@ import { clusterCenter, partitionBounds, partitionFor, type NetworkGraph } from 
 
 type Props = {
   graph: NetworkGraph; seed: number; ranks: number; partitioned: boolean;
-  selected: number; states?: string; disabled: boolean; onSelect: (node: number) => void;
+  selected: number; states?: string | Uint8Array; disabled: boolean; onSelect: (node: number) => void;
 };
 
 export default function NetworkView(props: Props) {
@@ -40,7 +40,7 @@ export default function NetworkView(props: Props) {
     let gpuWasPaused = false;
     const overviewLimit = 100000;
     const overviewCount = Math.min(props.graph.edgeCount, overviewLimit);
-    const edgeIndices = Uint32Array.from(props.graph.edges);
+    const edgeIndices = props.graph.edges instanceof Uint32Array ? props.graph.edges : Uint32Array.from(props.graph.edges);
     const shader = (type: number, source: string) => {
       const s = gl.createShader(type)!; gl.shaderSource(s, source); gl.compileShader(s);
       if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) || 'Shader compilation failed');
@@ -113,7 +113,7 @@ export default function NetworkView(props: Props) {
     };
     let yaw = 0, pitch = 0.15, distance = 300, blend = 0;
     const target = [0, 0, 0];
-    let previousStates: string | undefined, previousSelected = -2;
+    let previousStates: string | Uint8Array | undefined, previousSelected = -2;
     let previousPartitioned = false, frame = 0, disposed = false;
     let lastDraw = 0;
     let lastTime = performance.now(), width = 1, height = 1, pixelRatio = 1;
@@ -185,7 +185,8 @@ export default function NetworkView(props: Props) {
       const positionLoc = gl.getAttribLocation(program, 'position'); gl.vertexAttribPointer(positionLoc, 3, gl.FLOAT, false, 0, 0);
       if (p.states !== previousStates || (!p.states && p.selected !== previousSelected)) {
         previousStates = p.states;
-        if (p.states) { for (let i = 0; i < n; i++) nodeStates[i] = Math.max(0, p.states.charCodeAt(i) - 48); }
+        if (p.states instanceof Uint8Array) nodeStates.set(p.states);
+        else if (p.states) { for (let i = 0; i < n; i++) nodeStates[i] = Math.max(0, p.states.charCodeAt(i) - 48); }
         else { nodeStates.fill(0); if (p.selected >= 0) nodeStates[p.selected] = 1; }
         gl.bindBuffer(gl.ARRAY_BUFFER, stateBuffer); gl.bufferSubData(gl.ARRAY_BUFFER, 0, nodeStates);
       }

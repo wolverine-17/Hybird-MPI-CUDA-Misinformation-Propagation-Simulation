@@ -1,5 +1,14 @@
 export type ExecutionPlan = { mpiRanks: number; cpuSlots: number; gpuCount: number; sharedGpu: boolean; targetNodesPerRank: number; automatic: boolean; benchmarked?: boolean };
-export type NetworkGraph = { totalNodes: number; edgeCount: number; edges: number[]; executionPlan?: ExecutionPlan };
+export type NetworkGraph = { totalNodes: number; edgeCount: number; edges: number[] | Uint32Array; executionPlan?: ExecutionPlan };
+
+export function decodeGraph(buffer: ArrayBuffer): NetworkGraph {
+  if (buffer.byteLength < 16) throw new Error('Incomplete graph download');
+  const header = new DataView(buffer);
+  const edgeCount = header.getUint32(8, true) + header.getUint32(12, true) * 4294967296;
+  if (header.getUint32(0, true) !== 0x43464253 || buffer.byteLength !== 16 + edgeCount * 8)
+    throw new Error('Invalid graph download; rebuild the engine and frontend');
+  return { totalNodes: header.getUint32(4, true), edgeCount, edges: new Uint32Array(buffer, 16) };
+}
 export type PartitionInfo = { rank: number; begin: number; end: number; ghostNodes: number; adjacencyEntries: number; gpu: number };
 export type PartitionEvent = { kind: 'partition'; mpiRanks: number; crossEdges: number; partitions: PartitionInfo[] };
 

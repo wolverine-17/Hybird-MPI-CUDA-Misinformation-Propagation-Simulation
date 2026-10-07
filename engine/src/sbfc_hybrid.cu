@@ -6,6 +6,10 @@
 #include <string.h>
 #include <limits.h>
 #include "sbfc_core.hpp"
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 typedef struct { uint32_t n,degree,ticks,sample,source,preview,graphOnly; uint64_t seed; double alpha,beta,verify,forget; } Config;
 typedef struct { uint64_t edges,*offset; uint32_t *adj; } Graph;
@@ -21,7 +25,16 @@ __global__ static void step_kernel(const uint64_t*off,const uint32_t*adj,const u
     if(local<count)next[local]=update_state(off,adj,cur,local,begin+local,tick,seed,alpha,beta,verify,forget);
 }
 
-static void emit(uint32_t tick,uint64_t s,uint64_t b,uint64_t f,uint64_t reached,uint64_t peak,uint32_t peakTick,double elapsed,const uint8_t*state,uint32_t preview){printf("{\"kind\":\"progress\",\"tick\":%u,\"susceptible\":%llu,\"believers\":%llu,\"factCheckers\":%llu,\"reached\":%llu,\"maxBelievers\":%llu,\"maxBelieversTick\":%u,\"elapsedSeconds\":%.6f,\"nodeStates\":\"",tick,(unsigned long long)s,(unsigned long long)b,(unsigned long long)f,(unsigned long long)reached,(unsigned long long)peak,peakTick,elapsed);for(uint32_t i=0;i<preview;i++)putchar('0'+state[i]);puts("\"}");fflush(stdout);}
+static void emit(uint32_t tick,uint64_t s,uint64_t b,uint64_t f,uint64_t reached,uint64_t peak,uint32_t peakTick,double elapsed,const uint8_t*state,uint32_t preview) {
+  printf("{\"kind\":\"progress\",\"tick\":%u,\"susceptible\":%llu,\"believers\":%llu,\"factCheckers\":%llu,\"reached\":%llu,\"maxBelievers\":%llu,\"maxBelieversTick\":%u,\"elapsedSeconds\":%.6f",tick,(unsigned long long)s,(unsigned long long)b,(unsigned long long)f,(unsigned long long)reached,(unsigned long long)peak,peakTick,elapsed);
+  if(state) {
+    fputs(",\"nodeStates\":\"",stdout);
+    std::vector<char> text(preview);
+    for(uint32_t i=0;i<preview;i++)text[i]='0'+state[i];
+    fwrite(text.data(),1,text.size(),stdout);putchar('"');
+  }
+  puts("}");fflush(stdout);
+}
 
 int main(int argc,char**argv) {
   MPI_Init(&argc,&argv);
@@ -30,6 +43,25 @@ int main(int argc,char**argv) {
   if(c.graphOnly) {
     if(rank==0) {
       Graph graph=make_graph(c.n,c.degree,c.seed);
+      if(c.graphOnly==2) {
+        // Packed little-endian uint32 endpoints; avoid millions of printf calls
+        // and JSON conversions on the native/Python/browser hot path.
+        #ifdef _WIN32
+        _setmode(1,_O_BINARY); // stdout file descriptor
+        #endif
+        uint32_t header[4]={0x43464253,c.n,(uint32_t)graph.edges,(uint32_t)(graph.edges>>32)};
+        fwrite(header,sizeof(uint32_t),4,stdout);
+        uint32_t block[16384];size_t used=0;
+        for(uint32_t node=0;node<c.n;node++)for(uint64_t p=graph.offset[node];p<graph.offset[node+1];p++) {
+          uint32_t neighbour=graph.adj[p];
+          if(node<neighbour) {
+            block[used++]=node;block[used++]=neighbour;
+            if(used==16384){fwrite(block,sizeof(uint32_t),used,stdout);used=0;}
+          }
+        }
+        if(used)fwrite(block,sizeof(uint32_t),used,stdout);
+        fflush(stdout);free(graph.offset);free(graph.adj);
+      } else {
       printf("{\"totalNodes\":%u,\"edgeCount\":%llu,\"edges\":[",c.n,(unsigned long long)graph.edges);
       int comma=0;
       for(uint32_t node=0;node<c.n;node++)for(uint64_t p=graph.offset[node];p<graph.offset[node+1];p++) {
@@ -37,6 +69,7 @@ int main(int argc,char**argv) {
         if(node<neighbor){printf("%s%u,%u",comma?",":"",node,neighbor);comma=1;}
       }
       puts("]}");free(graph.offset);free(graph.adj);
+      }
     }
     MPI_Finalize();return 0;
   }
@@ -136,7 +169,7 @@ int main(int argc,char**argv) {
   uint64_t reached=1,peak=1,finalS=c.n-1,finalB=1,finalF=0;
   uint32_t peakTick=0;
   if(rank==0)emit(0,finalS,finalB,finalF,reached,peak,peakTick,0,fullState.data(),c.n);
-  MPI_Barrier(MPI_COMM_WORLD);double sim0=MPI_Wtime();
+  MPI_Barrier(MPI_COMM_WORLD);double sim0=MPI_Wtime(),lastFrame=sim0;
   for(uint32_t tick=1;tick<=c.ticks;tick++) {
     step_kernel<<<(count+255)/256,256>>>(doff,dadj,dcur,dnext,begin,count,tick,c.seed,c.alpha,c.beta,c.verify,c.forget);
     CUDA_OK(cudaGetLastError());CUDA_OK(cudaMemcpy(state.data(),dnext,count,cudaMemcpyDeviceToHost));
@@ -151,8 +184,14 @@ int main(int argc,char**argv) {
     // Synchronous ticks: remote states for t+1 come from the completed tick t.
     if(tick<c.ticks){exchange();CUDA_OK(cudaMemcpy(dcur,state.data(),state.size(),cudaMemcpyHostToDevice));}
     if(tick%c.sample==0||tick==c.ticks) {
-      gather();
-      if(rank==0)emit(tick,finalS,finalB,finalF,reached,peak,peakTick,MPI_Wtime()-sim0,fullState.data(),c.n);
+      // Counts keep the requested tick sampling. Large visual snapshots are
+      // wall-clock limited; all ranks agree before entering the gather.
+      int snapshot=0;
+      if(rank==0)snapshot=c.n<100000||tick==c.ticks||MPI_Wtime()-lastFrame>=0.25;
+      double frameDecision=MPI_Wtime();MPI_Bcast(&snapshot,1,MPI_INT,0,MPI_COMM_WORLD);
+      communicationSecs+=MPI_Wtime()-frameDecision;
+      if(snapshot){gather();lastFrame=MPI_Wtime();}
+      if(rank==0)emit(tick,finalS,finalB,finalF,reached,peak,peakTick,MPI_Wtime()-sim0,snapshot?fullState.data():nullptr,c.n);
     }
   }
   MPI_Barrier(MPI_COMM_WORLD);double simSecs=MPI_Wtime()-sim0,totalSecs=MPI_Wtime()-total0;

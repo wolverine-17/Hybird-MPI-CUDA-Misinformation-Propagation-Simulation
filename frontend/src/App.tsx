@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import NetworkView from "./NetworkView";
-import { type ExecutionPlan, type NetworkGraph, type PartitionEvent } from "./network";
+import { decodeGraph, type ExecutionPlan, type NetworkGraph, type PartitionEvent } from "./network";
 
 type Progress = {
   kind: "progress";
@@ -185,9 +185,10 @@ export default function App() {
     [partitioned, setPartitioned] = useState(false),
     [executionPlan, setExecutionPlan] = useState<ExecutionPlan | null>(null),
     [partition, setPartition] = useState<PartitionEvent | null>(null),
-    [nodeStates, setNodeStates] = useState<string | undefined>();
+    [nodeStates, setNodeStates] = useState<string | Uint8Array | undefined>();
   const eventSource = useRef<EventSource | null>(null);
-  useEffect(() => () => eventSource.current?.close(), []);
+  const stopUpdates = useRef<() => void>(() => {});
+  useEffect(() => () => { eventSource.current?.close(); stopUpdates.current(); }, []);
   const mpiRanks = partition?.mpiRanks ?? executionPlan?.mpiRanks ?? 2;
   const current = frames.at(-1),
     percent = Math.min(
@@ -226,10 +227,34 @@ export default function App() {
           nodes: String(config.nodes),
           meanDegree: String(config.meanDegree),
           seed: String(config.seed),
+          format: "binary",
         }),
-        r = await fetch(`/api/graph?${q}`),
-        data = await r.json();
-      if (!r.ok) throw new Error(data.error);
+        r = await fetch(`/api/graph?${q}`);
+      if (!r.ok) throw new Error((await r.json()).error);
+      let data: NetworkGraph;
+      if (r.headers.get("Content-Type")?.includes("application/octet-stream")) {
+        const length = Number(r.headers.get("Content-Length"));
+        // A notebook proxy may remove Content-Length when forwarding the body.
+        if (!Number.isSafeInteger(length) || length < 16) {
+          setStatus("Downloading complete network");
+          data = decodeGraph(await r.arrayBuffer());
+        } else {
+        const bytes = new Uint8Array(length), reader = r.body?.getReader();
+        if (!reader) throw new Error("Graph download could not start");
+        let received = 0, lastPercent = -1;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (received + value.byteLength > length) { await reader.cancel(); throw new Error("Graph download exceeds its expected size"); }
+          bytes.set(value, received); received += value.byteLength;
+          const percent = Math.floor(received * 100 / length);
+          if (percent !== lastPercent) { setStatus(`Downloading complete network: ${percent}%`); lastPercent = percent; }
+        }
+        if (received !== length) throw new Error("Incomplete graph download");
+        data = decodeGraph(bytes.buffer);
+        }
+        data.executionPlan = JSON.parse(r.headers.get("X-Execution-Plan") || "null") ?? undefined;
+      } else data = await r.json();
       setGraph(data);
       setExecutionPlan(data.executionPlan ?? null);
       setFrames([]);
@@ -253,7 +278,7 @@ export default function App() {
     setPartition(null);
     setRunning(true);
     setStatus("Launching MPI + CUDA engine");
-    eventSource.current?.close();
+    eventSource.current?.close(); stopUpdates.current();
     try {
       const response = await fetch("/api/simulations", {
         method: "POST",
@@ -267,7 +292,38 @@ export default function App() {
       setControlsOpen(false);
       const source = new EventSource(`/api/simulations/${result.id}/events`);
       eventSource.current = source;
-      source.onmessage = (message) => {
+      let active = true, stateTag = '', pendingState: Promise<void> | undefined;
+      let pollTimer: ReturnType<typeof setTimeout> | undefined;
+      const controller = new AbortController();
+      const pendingCounts: Progress[] = [];
+      let flushTimer: ReturnType<typeof setTimeout> | undefined;
+      const flushCounts = () => {
+        if (flushTimer) clearTimeout(flushTimer); flushTimer = undefined;
+        if (pendingCounts.length) {
+          const batch = pendingCounts.splice(0); setFrames(old => [...old, ...batch]);
+          setStatus(`Hybrid simulation: tick ${batch.at(-1)!.tick} / ${config.ticks}`);
+        }
+      };
+      const fetchState = (): Promise<void> => {
+        if (pendingState) return pendingState;
+        pendingState = (async () => {
+          const r = await fetch(`/api/simulations/${result.id}/state`, { signal: controller.signal, cache: 'no-store', headers: stateTag ? { 'If-None-Match': stateTag } : {} });
+          if (r.status === 204 || r.status === 304) return;
+          if (!r.ok) throw new Error('Could not retrieve the latest node colors');
+          const state = new Uint8Array(await r.arrayBuffer());
+          if (state.length !== graph.totalNodes) throw new Error('Engine state length does not match the network. Rebuild the engine and retry.');
+          if (active) { stateTag = r.headers.get('ETag') || ''; setNodeStates(state); }
+        })().finally(() => { pendingState = undefined; });
+        return pendingState;
+      };
+      const poll = async () => {
+        try { await fetchState(); }
+        catch (e) { if (active) setError(e instanceof Error ? e.message : String(e)); }
+        if (active) pollTimer = setTimeout(poll, 250);
+      };
+      stopUpdates.current = () => { active = false; controller.abort(); clearTimeout(pollTimer); clearTimeout(flushTimer); };
+      void poll();
+      source.onmessage = async (message) => {
         const event = JSON.parse(message.data) as Progress | Summary | PartitionEvent | { kind: "error"; message: string };
         if (event.kind === "partition") {
           setPartition(event);
@@ -284,14 +340,24 @@ export default function App() {
           // Keep only counts in chart history, never N-node snapshots per tick.
           const { nodeStates: snapshot, ...counts } = event;
           void snapshot;
-          setFrames((old) => [...old, counts]);
-          setStatus(`Hybrid simulation: tick ${event.tick} / ${config.ticks}`);
+          pendingCounts.push(counts);
+          if (!flushTimer) flushTimer = setTimeout(flushCounts, 100);
         } else if (event.kind === "summary") {
+          source.close();
+          flushCounts();
+          setStatus("Simulation finished; displaying final node colors");
+          if (pollTimer) clearTimeout(pollTimer);
+          // An in-flight response may predate completion; fetch again for final colors.
+          try { if (pendingState) await pendingState; await fetchState(); }
+          catch (e) { if (active) setError(e instanceof Error ? e.message : String(e)); }
+          if (!active) return;
+          stopUpdates.current();
           setSummary(event);
           setRunning(false);
           setStatus("Simulation completed");
           source.close();
         } else {
+          flushCounts(); stopUpdates.current();
           setError(event.message);
           setRunning(false);
           setStatus("Simulation failed");
@@ -300,12 +366,14 @@ export default function App() {
       };
       source.onerror = () => {
         if (source.readyState === EventSource.CLOSED) return;
+        flushCounts(); stopUpdates.current();
         setError("Connection to the Colab simulation stream was interrupted.");
         setRunning(false);
         setStatus("Connection interrupted");
         source.close();
       };
     } catch (err) {
+      stopUpdates.current();
       setError(err instanceof Error ? err.message : String(err));
       setRunning(false);
       setStatus("Simulation failed");

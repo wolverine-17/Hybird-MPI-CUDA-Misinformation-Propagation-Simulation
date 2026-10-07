@@ -48,6 +48,30 @@ def main():
             assert states == baseline, f"{ranks}-rank states/counts differ from the one-rank reference"
         print(f"PASS real MPI/CUDA: {ranks} ranks, {expected_cross} cross-partition links, identical states/counts")
 
+    # Exercise the wall-clock-limited visual path with actual MPI collectives.
+    large_reference = None
+    for ranks in (2, 4):
+        command = ["mpirun", "--oversubscribe", "--bind-to", "none"]
+        if os.geteuid() == 0:
+            command.append("--allow-run-as-root")
+        command += ["-np", str(ranks), str(engine), "--nodes", "100000", "--mean-degree", "6",
+                    "--seed", "42", "--source-node", "0", "--ticks", "12", "--sample-every", "1"]
+        result = subprocess.run(command, text=True, capture_output=True, timeout=180)
+        if result.returncode:
+            raise RuntimeError(f"Large-graph {ranks}-rank validation failed:\n{result.stderr}")
+        events = [json.loads(line) for line in result.stdout.splitlines() if line.startswith('{')]
+        progress = [e for e in events if e['kind'] == 'progress']
+        assert [e['tick'] for e in progress] == list(range(13))
+        assert len(progress[0]['nodeStates']) == 100000 and len(progress[-1]['nodeStates']) == 100000
+        counts = [{k: v for k, v in e.items() if k not in ('elapsedSeconds', 'nodeStates')} for e in progress]
+        reference = (counts, progress[-1]['nodeStates'])
+        if large_reference is None:
+            large_reference = reference
+        else:
+            assert reference == large_reference, 'Visual throttling changed counts or final states across ranks'
+        assert events[-1]['kind'] == 'summary'
+        print(f'PASS large-graph MPI/CUDA: {ranks} ranks, every count sample and exact final colors')
+
 
 if __name__ == "__main__":
     main()

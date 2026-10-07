@@ -4,6 +4,7 @@ import json
 import math
 import os
 import subprocess
+import struct
 import tempfile
 import threading
 import uuid
@@ -18,6 +19,9 @@ ENGINE_DIR = ROOT / "engine" / "bin"
 
 RUNS: dict[str, dict] = {}
 RUNS_LOCK = threading.Lock()
+GRAPH_CACHE_LOCK = threading.Lock()
+GRAPH_CACHE: tuple[tuple, bytes] | None = None
+STATE_BYTES = bytes([0 if i == 48 else 1 if i == 49 else 2 if i == 50 else i for i in range(256)])
 
 EXECUTABLES = {
     "hybrid": "sbfc-hybrid.exe" if os.name == "nt" else "sbfc-hybrid",
@@ -142,6 +146,30 @@ def graph_preview(nodes: int, mean_degree: int, seed: int) -> dict:
     return graph
 
 
+def graph_binary(nodes: int, mean_degree: int, seed: int) -> bytes:
+    """Pass the native packed export through without constructing millions of Python ints."""
+    global GRAPH_CACHE
+    validate_config({"nodes": nodes, "meanDegree": mean_degree, "seed": seed, "sourceNode": 0})
+    executable = ENGINE_DIR / EXECUTABLES["hybrid"]
+    if not executable.exists():
+        raise RuntimeError("Build the native engine before generating a network (run the Colab build cell).")
+    key = (nodes, mean_degree, seed, executable.stat().st_mtime_ns)
+    with GRAPH_CACHE_LOCK:
+        if GRAPH_CACHE is not None and GRAPH_CACHE[0] == key:
+            return GRAPH_CACHE[1]
+        result = subprocess.run([str(executable), "--nodes", str(nodes), "--mean-degree", str(mean_degree),
+                                 "--seed", str(seed), "--graph-only", "2"],
+                                cwd=ROOT, capture_output=True, check=True, timeout=300)
+        data = result.stdout
+        if len(data) < 16:
+            raise RuntimeError("Invalid binary graph export; rebuild the native engine")
+        magic, exported_nodes, edges = struct.unpack_from("<IIQ", data)
+        if magic != 0x43464253 or exported_nodes != nodes or len(data) != 16 + edges * 8:
+            raise RuntimeError("Invalid binary graph export; rebuild the native engine")
+        GRAPH_CACHE = (key, data) if len(data) <= 64 * 1024**2 else None
+        return data
+
+
 def append_event(run_id: str, event: dict) -> None:
     with RUNS_LOCK:
         run = RUNS[run_id]
@@ -149,6 +177,8 @@ def append_event(run_id: str, event: dict) -> None:
         # Older events remain immutable for any client currently sending them.
         previous = run.get("state_index")
         if "nodeStates" in event:
+            run["state_bytes"] = event["nodeStates"].encode("ascii").translate(STATE_BYTES)
+            run["state_tick"] = event["tick"]
             if previous is not None:
                 run["events"][previous] = {
                     k: v for k, v in run["events"][previous].items() if k != "nodeStates"
@@ -266,19 +296,57 @@ class Handler(SimpleHTTPRequestHandler):
             from urllib.parse import parse_qs
             try:
                 query = parse_qs(urlparse(self.path).query)
-                payload = graph_preview(
+                graph_args = (
                     int(query.get("nodes", ["10000"])[0]),
                     int(query.get("meanDegree", ["6"])[0]),
                     int(query.get("seed", ["42"])[0]),
                 )
-                self.send_json(HTTPStatus.OK, payload)
+                if query.get("format", [""])[0] == "binary":
+                    payload = graph_binary(*graph_args)
+                    plan = automatic_execution_plan(graph_args[0], graph_args[1])
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("X-Execution-Plan", json.dumps(plan, separators=(",", ":")))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
+                    self.send_json(HTTPStatus.OK, graph_preview(*graph_args))
             except (ValueError, TypeError) as exc:
                 self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
                 message = getattr(exc, "stderr", None) or str(exc)
+                if isinstance(message, bytes):
+                    message = message.decode("utf-8", errors="replace")
                 self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": message})
             return
         parts = path.strip("/").split("/")
+        if len(parts) == 4 and parts[:2] == ["api", "simulations"] and parts[3] == "state":
+            with RUNS_LOCK:
+                run = RUNS.get(parts[2])
+                if run is None:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                state, tick = run.get("state_bytes"), run.get("state_tick")
+            if state is None:
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.end_headers()
+                return
+            tag = f'"{tick}"'
+            if self.headers.get("If-None-Match") == tag:
+                self.send_response(HTTPStatus.NOT_MODIFIED)
+                self.end_headers()
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(state)))
+            self.send_header("X-State-Tick", str(tick))
+            self.send_header("ETag", tag)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(state)
+            return
         if len(parts) == 4 and parts[:2] == ["api", "simulations"] and parts[3] == "events":
             self.stream_events(parts[2])
             return
@@ -314,7 +382,9 @@ class Handler(SimpleHTTPRequestHandler):
                     done = run["done"]
                     cursor = len(run["events"])
                 for event in events:
-                    payload = json.dumps(event, separators=(",", ":"))
+                    # Counts/history remain lossless; large snapshots are fetched
+                    # independently so they cannot delay progress or completion.
+                    payload = json.dumps({k: v for k, v in event.items() if k != "nodeStates"}, separators=(",", ":"))
                     self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                     self.wfile.flush()
                 if done:

@@ -14,6 +14,14 @@ repository contains only the proposed hybrid MPI+CUDA system and its React UI.
    separates into C1...Cn according to the actual MPI rank assignments.
 6. Review reach, peak Believers, peak tick, graph time, simulation time, and total time.
 
+Graph downloads use a packed binary export (`--graph-only 2`): a 16-byte
+little-endian header followed by pairs of uint32 node IDs. Python forwards the
+bytes without parsing/re-encoding millions of integers, and the browser reads
+the endpoints as a typed array. Download progress is shown when the notebook
+proxy preserves Content-Length. The server caches the last export up to 64 MiB,
+keyed by nodes, degree, seed, and engine build time. The JSON export remains
+available for validation. Rebuild the engine and frontend together after updating.
+
 The browser renders every configured node using WebGL 2 buffers. Below 20,000
 nodes, spring layout and spatial-cell repulsion run in a background worker.
 Larger graphs use a GPU-resident approximate spring layout with at most eight
@@ -33,7 +41,13 @@ that count; **Draw all connections (slower)** restores the complete edge display
 Large graphs use one-pixel nodes, a capped canvas pixel ratio, a 30-frame-per-second
 draw schedule, and GPU picking. Layout pauses during camera/node gestures.
 Increase Record every N ticks to reduce
-full-network state traffic for large runs. Only the latest node-state snapshot is
+analytics sampling for large runs. Progress and analytics travel in a lightweight
+SSE stream; colors are fetched separately as the latest byte-per-node snapshot.
+At 100,000 nodes and above, the engine limits full visual snapshots to four per
+second while preserving every requested population-count sample and always
+emitting initial/final colors. React batches count updates and the viewer polls
+without overlapping requests. Completion waits for the final colors, avoiding
+a backlog of old million-node snapshots. Only the latest node-state snapshot is
 retained alongside population-count history.
 
 MPI partitions use the engine's contiguous node-ID ranges. Rank 0 owns C1, rank 1

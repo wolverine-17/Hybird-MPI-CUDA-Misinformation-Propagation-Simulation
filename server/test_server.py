@@ -1,8 +1,12 @@
 """Protocol tests that do not require a GPU: python -m unittest discover -s server."""
 import json
 import subprocess
+import struct
 import threading
 import unittest
+import urllib.request
+import urllib.error
+from http.server import ThreadingHTTPServer
 from unittest.mock import patch
 import server
 
@@ -10,6 +14,58 @@ import server
 class ProtocolTests(unittest.TestCase):
     def setUp(self):
         server.RUNS.clear()
+        server.GRAPH_CACHE = None
+
+    def test_binary_export_is_passed_through_and_cached(self):
+        payload = struct.pack("<IIQ4I", 0x43464253, 1000000, 2, 0, 1, 999998, 999999)
+        with patch.object(server.Path, "exists", return_value=True), patch.object(server.Path, "stat") as stat, patch.object(server.subprocess, "run") as run:
+            stat.return_value.st_mtime_ns = 123
+            run.return_value.stdout = payload
+            self.assertEqual(server.graph_binary(1000000, 6, 42), payload)
+            self.assertEqual(server.graph_binary(1000000, 6, 42), payload)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0][-2:], ["--graph-only", "2"])
+            server.graph_binary(1000000, 6, 43)
+            self.assertEqual(run.call_count, 2)
+            stat.return_value.st_mtime_ns = 124
+            server.graph_binary(1000000, 6, 43)
+            self.assertEqual(run.call_count, 3)
+
+    def test_binary_export_rejects_truncation_and_wrong_graph(self):
+        for payload in (b"bad", struct.pack("<IIQ", 0x43464253, 100, 1), struct.pack("<IIQ", 0x43464253, 99, 0)):
+            with patch.object(server.Path, "exists", return_value=True), patch.object(server.Path, "stat"), patch.object(server.subprocess, "run") as run:
+                run.return_value.stdout = payload
+                with self.assertRaises(RuntimeError):
+                    server.graph_binary(100, 6, 42)
+
+    def test_state_endpoint_and_lightweight_stream_preserve_final_snapshot(self):
+        server.RUNS['live-test'] = {"events": [], "done": False, "condition": threading.Condition(server.RUNS_LOCK)}
+        server.append_event('live-test', {"kind": "progress", "tick": 0, "nodeStates": "0102", "believers": 1})
+        server.append_event('live-test', {"kind": "progress", "tick": 1, "nodeStates": "1122", "believers": 2})
+        server.append_event('live-test', {"kind": "summary", "ticks": 1})
+        http = ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        thread = threading.Thread(target=http.serve_forever, daemon=True); thread.start()
+        url = f'http://127.0.0.1:{http.server_port}/api/simulations/live-test'
+        try:
+            with urllib.request.urlopen(url + '/state') as response:
+                self.assertEqual(response.read(), bytes([1, 1, 2, 2]))
+                self.assertEqual(response.headers['X-State-Tick'], '1')
+                tag = response.headers['ETag']
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(urllib.request.Request(url + '/state', headers={'If-None-Match': tag}))
+            self.assertEqual(error.exception.code, 304)
+            events = []
+            with urllib.request.urlopen(url + '/events', timeout=3) as response:
+                while True:
+                    line = response.readline()
+                    if line.startswith(b'data: '):
+                        event = json.loads(line[6:]); events.append(event)
+                        if event['kind'] == 'summary': break
+            self.assertEqual([e.get('tick') for e in events[:-1]], [0, 1])
+            self.assertTrue(all('nodeStates' not in e for e in events))
+            self.assertEqual(server.RUNS['live-test']['state_bytes'], bytes([1, 1, 2, 2]))
+        finally:
+            http.shutdown(); http.server_close(); thread.join()
 
     def test_full_network_export_uses_native_generator(self):
         payload = {"totalNodes": 100000, "edgeCount": 2, "edges": [0, 1, 99998, 99999]}

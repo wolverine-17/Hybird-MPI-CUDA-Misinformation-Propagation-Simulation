@@ -41,6 +41,28 @@ browser memory and graphics hardware. Hide
 connections to reduce clutter or increase the sampling interval to reduce live
 state traffic. There is no capped or sampled node preview.
 
+Generation uses the CPU and sends a compact binary edge buffer to the browser.
+CUDA computes simulation ticks after the graph and partitions have been prepared.
+The flowing browser layout uses your local graphics hardware, so it does not
+appear in Colab's GPU memory panel. That panel reports memory, not compute
+utilization. To inspect an actively progressing simulation, run a notebook cell:
+
+```python
+!nvidia-smi
+!nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv
+```
+
+Look for `sbfc-hybrid` compute processes. Short kernel bursts can yield a low
+utilization sample, and memory is released when the native run finishes.
+
+For large simulations the live viewer displays the latest snapshot rather than
+replaying every older color frame. Node colors use a separate byte buffer,
+polled up to four times per second; progress/count history remains in the SSE
+stream. At 100,000 nodes or above the engine also caps visual snapshot generation
+at four per second, including initial/final states regardless of the cap.
+This changes visualization frequency, not CUDA ticks or the requested analytics
+samples. Final colors are fetched before the UI reports completion.
+
 After updating, start a fresh Colab runtime and run all cells so the server,
 frontend, and native binary use the same version. The build cell checks real
 MPI/CUDA results with 1/2/3/4 ranks before the dashboard opens. If this validation
